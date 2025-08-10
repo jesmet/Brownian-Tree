@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Brownian Tree (DLA) — Diffusion-Limited Aggregation</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; background:#0b1220; color:#e6eef8;
+         display:flex; gap:20px; align-items:flex-start; padding:18px; }
+  .panel { width: 360px; padding:14px; background:linear-gradient(180deg,#071026,#0b1220); border-radius:12px;
+           box-shadow:0 8px 30px rgba(0,0,0,0.6); }
+  canvas { background:#000; border-radius:8px; display:block; }
+  label{display:block;margin-top:8px;font-size:13px;color:#9fbadf}
+  input[type=range]{width:100%}
+  .controls{display:flex; gap:8px; margin-top:12px}
+  button{padding:8px 10px;border-radius:8px;border:none;background:#1d9bf0;color:white;cursor:pointer}
+  button.ghost{background:transparent;border:1px solid rgba(29,155,240,0.16);color:#9fbadf}
+  .small{font-size:12px;color:#93b6d8;margin-top:6px}
+  .stat{font-size:13px;margin-top:8px}
+</style>
+</head>
+<body>
+  <div>
+    <canvas id="c" width="700" height="700"></canvas>
+    <div class="small">Brownian Tree / DLA. Seed at center. Particles are released on spawn circle and do random walks until they stick to the cluster.</div>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin:0 0 6px 0">DLA Controls</h3>
+
+    <label>Particles per frame: <span id="ppfVal">20</span></label>
+    <input id="ppf" type="range" min="1" max="100" value="20">
+
+    <label>Spawn radius (pixels): <span id="spawnVal">180</span></label>
+    <input id="spawnR" type="range" min="20" max="350" value="180">
+
+    <label>Kill radius (pixels): <span id="killVal">360</span></label>
+    <input id="killR" type="range" min="50" max="600" value="360">
+
+    <label>Max walk steps per particle: <span id="maxStepsVal">20000</span></label>
+    <input id="maxSteps" type="range" min="100" max="50000" step="100" value="20000">
+
+    <label>Particle color scheme:
+      <select id="scheme">
+        <option value="hue">Hue (color by stick index)</option>
+        <option value="white">White</option>
+        <option value="heat">Heatmap</option>
+      </select>
+    </label>
+
+    <div class="controls">
+      <button id="startBtn">Start</button>
+      <button id="pauseBtn" class="ghost">Pause</button>
+      <button id="resetBtn" class="ghost">Reset</button>
+    </div>
+
+    <div class="stat">Particles stuck: <strong id="stuck">1</strong></div>
+    <div class="stat">Active particles: <strong id="active">0</strong></div>
+    <div class="stat">FPS: <strong id="fps">0</strong></div>
+    <div class="small">Tip: Increase particles-per-frame for faster growth (may slow down CPU). Use reset to restart.</div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { willReadFrequently: false });
+  const W = canvas.width, H = canvas.height;
+  const cx = Math.floor(W/2), cy = Math.floor(H/2);
+
+  const ppfEl = document.getElementById('ppf'), ppfVal = document.getElementById('ppfVal');
+  const spawnEl = document.getElementById('spawnR'), spawnVal = document.getElementById('spawnVal');
+  const killEl = document.getElementById('killR'), killVal = document.getElementById('killVal');
+  const maxStepsEl = document.getElementById('maxSteps'), maxStepsVal = document.getElementById('maxStepsVal');
+  const startBtn = document.getElementById('startBtn'), pauseBtn = document.getElementById('pauseBtn'), resetBtn = document.getElementById('resetBtn');
+  const stuckEl = document.getElementById('stuck'), activeEl = document.getElementById('active'), fpsEl = document.getElementById('fps');
+  const schemeEl = document.getElementById('scheme');
+
+  let spawnRadius = Number(spawnEl.value);
+  let killRadius  = Number(killEl.value);
+  let particlesPerFrame = Number(ppfEl.value);
+  let maxWalkSteps = Number(maxStepsEl.value);
+
+  const gridW = W, gridH = H;
+  const grid = new Uint8Array(gridW * gridH); 
+  function idx(x,y){ return y*gridW + x; }
+
+  function resetGrid(){
+    grid.fill(0);
+    
+    grid[idx(cx,cy)] = 1;
+   
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0,0,W,H);
+    
+    const seedColor = 'rgb(255,255,255)';
+    ctx.fillStyle = seedColor;
+    ctx.fillRect(cx,cy,1,1);
+    stuckCount = 1;
+    particlesCreated = 0;
+    lastTime = performance.now();
+  }
+
+  let stuckCount = 1;
+  let particlesCreated = 0;
+  let running = false;
+  let rafId = null;
+  let lastFPSCheck = performance.now();
+  let frames = 0;
+  let lastTime = performance.now();
+  let currentFPS = 0;
+
+  const neighbors = [
+    [-1, 0],[1,0],[0,-1],[0,1],
+    [-1,-1],[-1,1],[1,-1],[1,1]
+  ];
+
+  function spawnParticle() {
+    let angle = Math.random() * Math.PI * 2;
+    const r = spawnRadius;
+   
+    const x = Math.round(cx + Math.cos(angle) * r);
+    const y = Math.round(cy + Math.sin(angle) * r);
+    return { x, y };
+  }
+
+  function touchesCluster(x,y){
+    if (x<=0 || x>=gridW-1 || y<=0 || y>=gridH-1) return false;
+    for (let i=0;i<neighbors.length;i++){
+      const nx = x + neighbors[i][0], ny = y + neighbors[i][1];
+      if (grid[idx(nx,ny)]) return true;
+    }
+    return false;
+  }
+
+  function colorForIndex(i){
+    const scheme = schemeEl.value;
+    if (scheme === 'white') return [255,255,255];
+    if (scheme === 'heat') {
+      
+      const t = Math.min(1, i/6000);
+      const r = Math.round(255 * t);
+      const g = Math.round(80 * (1 - t));
+      const b = Math.round(200 * (1 - t));
+      return [r,g,b];
+    }
+  
+    const hue = (i * 7) % 360;
+    
+    return hslToRgb(hue/360, 0.6, 0.5);
+  }
+
+  function hslToRgb(h, s, l){
+    let r,g,b;
+    if (s === 0){ r=g=b= l; }
+    else {
+      const hue2rgb = (p,q,t) => {
+        if (t<0) t+=1;
+        if (t>1) t-=1;
+        if (t<1/6) return p + (q-p)*6*t;
+        if (t<1/2) return q;
+        if (t<2/3) return p + (q-p)*(2/3 - t)*6;
+        return p;
+      };
+      const q = l < 0.5 ? l * (1 + s) : l + s - l*s;
+      const p = 2*l - q;
+      r = hue2rgb(p,q,h+1/3);
+      g = hue2rgb(p,q,h);
+      b = hue2rgb(p,q,h-1/3);
+    }
+    return [ Math.round(r*255), Math.round(g*255), Math.round(b*255) ];
+  }
+
+  function walkAndStick() {
+    let {x,y} = spawnParticle();
+    let steps = 0;
+
+    while (steps < maxWalkSteps) {
+      
+      const dx = x - cx, dy = y - cy;
+      const dist2 = dx*dx + dy*dy;
+      if (dist2 > killRadius * killRadius) {
+       
+        return null;
+      }
+
+      if (touchesCluster(x,y)) {
+        
+        grid[idx(x,y)] = 1;
+        stuckCount++;
+        
+        const rgb = colorForIndex(stuckCount);
+        ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+        ctx.fillRect(x,y,1,1);
+        return {x,y};
+      }
+
+      const r = Math.random();
+      if (r < 0.25) x += (Math.random() < 0.5 ? -1 : 1);
+      else if (r < 0.5) y += (Math.random() < 0.5 ? -1 : 1);
+      else {
+        
+        x += Math.random() < 0.5 ? -1 : 1;
+        y += Math.random() < 0.5 ? -1 : 1;
+      }
+
+      if (x < 1) x = 1;
+      if (x > gridW-2) x = gridW-2;
+      if (y < 1) y = 1;
+      if (y > gridH-2) y = gridH-2;
+
+      steps++;
+    }
+    return null;
+  }
+
+  function step(){
+    const start = performance.now();
+    let createdThisFrame = 0;
+    for (let i=0; i<particlesPerFrame; i++){
+      const res = walkAndStick();
+      particlesCreated++;
+      if (res) createdThisFrame++;
+    }
+    stuckEl.textContent = stuckCount;
+    activeEl.textContent = particlesPerFrame;
+    frames++;
+    const now = performance.now();
+    if (now - lastFPSCheck >= 500) {
+      currentFPS = Math.round((frames*1000) / (now - lastFPSCheck));
+      fpsEl.textContent = currentFPS;
+      frames = 0;
+      lastFPSCheck = now;
+    }
+    if (running) rafId = requestAnimationFrame(step);
+  }
+
+  ppfEl.addEventListener('input', ()=> { particlesPerFrame = Number(ppfEl.value); ppfVal.textContent = particlesPerFrame; });
+  spawnEl.addEventListener('input', ()=> { spawnRadius = Number(spawnEl.value); spawnVal.textContent = spawnRadius; });
+  killEl.addEventListener('input', ()=> { killRadius = Number(killEl.value); killVal.textContent = killRadius; });
+  maxStepsEl.addEventListener('input', ()=> { maxWalkSteps = Number(maxStepsEl.value); maxStepsVal.textContent = maxWalkSteps; });
+
+  startBtn.addEventListener('click', ()=> {
+    if (!running) {
+      running = true;
+      if (ctx && ctx.state === 'suspended') { ctx.resume && ctx.resume(); } // audio context compatibility if used later
+      lastFPSCheck = performance.now();
+      frames = 0;
+      rafId = requestAnimationFrame(step);
+    }
+  });
+
+  pauseBtn.addEventListener('click', ()=> {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+  });
+
+  resetBtn.addEventListener('click', ()=> {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    resetGrid();
+    updateStats();
+  });
+
+  function updateStats(){
+    stuckEl.textContent = stuckCount;
+    activeEl.textContent = particlesPerFrame;
+    fpsEl.textContent = currentFPS;
+  }
+
+  resetGrid();
+  updateStats();
+
+  function drawGuides(){
+    ctx.save();
+    ctx.globalAlpha = 0.06;
+    ctx.strokeStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(cx, cy, spawnRadius, 0, Math.PI*2); ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy, killRadius, 0, Math.PI*2); ctx.stroke();
+    ctx.restore();
+  }
+
+})();
+</script>
+</body>
+</html>
